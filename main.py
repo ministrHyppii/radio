@@ -6,10 +6,13 @@ import json
 import os
 import asyncio
 import yt_dlp
-from config import TOKEN
+
+# ===== ВСТАВЬТЕ СВОЙ ТОКЕН СЮДА =====
+TOKEN = 'ВАШ_ТОКЕН_СЮДА'
+# =====================================
 
 # ===== НАСТРОЙКИ =====
-DATA_FILE = 'radio_urls.json'   # Храним URL радио для каждого сервера
+DATA_FILE = 'radio_urls.json'
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
@@ -29,7 +32,6 @@ YTDL_OPTIONS = {
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
 }
-# =====================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -39,7 +41,7 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
-# Загрузка/сохранение URL
+# ----- Работа с файлом URL -----
 def load_urls():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -52,32 +54,32 @@ def save_urls(urls):
 
 radio_urls = load_urls()
 
-# Храним объекты плеера для каждого гильда (сервера)
+# ----- Хранилище плееров -----
 class GuildPlayer:
     def __init__(self, guild_id):
         self.guild_id = guild_id
         self.voice_client = None
-        self.current_source = None  # 'radio' или 'yt'
+        self.current_source = None
         self.current_url = None
         self.is_playing = False
         self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
     async def play_audio(self, source_url, source_type='radio'):
-        """Запускает воспроизведение аудиопотока"""
         if self.voice_client is None or not self.voice_client.is_connected():
             return False
         if self.voice_client.is_playing():
             self.voice_client.stop()
-        # Для YouTube/Rutube получаем реальный аудио URL
         actual_url = source_url
         if source_type == 'yt':
             try:
-                info = self.ytdl.extract_info(source_url, download=False)
+                info = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.ytdl.extract_info(source_url, download=False)
+                )
                 if 'entries' in info:
                     info = info['entries'][0]
                 actual_url = info['url']
             except Exception as e:
-                print(f"Ошибка получения аудиопотока: {e}")
+                print(f"Ошибка получения аудио с YouTube: {e}")
                 return False
         audio = FFmpegPCMAudio(actual_url, **FFMPEG_OPTIONS)
         self.voice_client.play(audio)
@@ -98,7 +100,7 @@ def get_player(guild_id):
         players[guild_id] = GuildPlayer(guild_id)
     return players[guild_id]
 
-# ===== СОБЫТИЕ ГОТОВНОСТИ =====
+# ----- СОБЫТИЯ -----
 @bot.event
 async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
@@ -108,9 +110,7 @@ async def on_ready():
     except Exception as e:
         print(f'❌ Ошибка синхронизации: {e}')
 
-# ===== КОМАНДЫ =====
-
-# /в_войс [канал]
+# ----- КОМАНДА: /в_войс -----
 @tree.command(name="в_войс", description="Подключить бота к голосовому каналу")
 @app_commands.describe(канал="Выберите голосовой канал")
 async def join_voice(interaction: discord.Interaction, канал: discord.VoiceChannel = None):
@@ -122,6 +122,7 @@ async def join_voice(interaction: discord.Interaction, канал: discord.Voice
         await interaction.response.send_message("❌ Нет прав на подключение.", ephemeral=True)
         return
     voice = interaction.guild.voice_client
+    player = get_player(interaction.guild.id)
     if voice and voice.is_connected():
         if voice.channel == target:
             await interaction.response.send_message("ℹ️ Бот уже здесь.", ephemeral=True)
@@ -129,10 +130,7 @@ async def join_voice(interaction: discord.Interaction, канал: discord.Voice
         await voice.move_to(target)
     else:
         voice = await target.connect()
-    # Сохраняем voice_client в плеере
-    player = get_player(interaction.guild.id)
-    player.voice_client = voice
-    # Если есть сохранённый URL радио, запускаем
+        player.voice_client = voice
     url = radio_urls.get(str(interaction.guild.id))
     if url:
         success = await player.play_audio(url, 'radio')
@@ -143,7 +141,7 @@ async def join_voice(interaction: discord.Interaction, канал: discord.Voice
     else:
         await interaction.response.send_message(f"✅ Подключён к **{target.name}**. Используйте `/плей` или `/настройка_юрл`.")
 
-# /из_войса
+# ----- КОМАНДА: /из_войса -----
 @tree.command(name="из_войса", description="Отключить бота")
 async def leave_voice(interaction: discord.Interaction):
     voice = interaction.guild.voice_client
@@ -157,14 +155,13 @@ async def leave_voice(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ Бот не в канале.", ephemeral=True)
 
-# /настройка_юрл <url>
+# ----- КОМАНДА: /настройка_юрл -----
 @tree.command(name="настройка_юрл", description="Сохранить URL радиостанции для сервера")
 @app_commands.describe(url="Ссылка на аудиопоток (mp3, aac, etc.)")
 async def set_radio(interaction: discord.Interaction, url: str):
     guild_id = str(interaction.guild.id)
     radio_urls[guild_id] = url
     save_urls(radio_urls)
-    # Если бот уже играет, перезапускаем с новым URL
     player = get_player(interaction.guild.id)
     if player.voice_client and player.voice_client.is_connected():
         success = await player.play_audio(url, 'radio')
@@ -175,16 +172,14 @@ async def set_radio(interaction: discord.Interaction, url: str):
     else:
         await interaction.response.send_message("✅ URL сохранён. Подключите бота командой `/в_войс`.")
 
-# /плей <запрос>
+# ----- КОМАНДА: /плей -----
 @tree.command(name="плей", description="Воспроизвести YouTube/Rutube (прямой эфир или видео)")
 @app_commands.describe(запрос="Ссылка или поисковый запрос")
 async def play(interaction: discord.Interaction, запрос: str):
-    # Проверяем, что пользователь в голосовом канале
     if interaction.user.voice is None:
         await interaction.response.send_message("❌ Вы не в голосовом канале!", ephemeral=True)
         return
     target = interaction.user.voice.channel
-    # Подключаемся, если не подключены
     voice = interaction.guild.voice_client
     player = get_player(interaction.guild.id)
     if not voice or not voice.is_connected():
@@ -195,10 +190,8 @@ async def play(interaction: discord.Interaction, запрос: str):
         player.voice_client = voice
     elif voice.channel != target:
         await voice.move_to(target)
-    # Загружаем аудио с yt-dlp
     await interaction.response.send_message(f"🔍 Ищу `{запрос}`...")
     try:
-        # Используем yt-dlp для получения прямого аудио URL
         ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, lambda: ytdl.extract_info(запрос, download=False))
@@ -206,17 +199,15 @@ async def play(interaction: discord.Interaction, запрос: str):
             info = info['entries'][0]
         audio_url = info['url']
         title = info.get('title', 'неизвестный трек')
-        # Воспроизводим
         success = await player.play_audio(audio_url, 'yt')
         if success:
-            # Сохраняем текущий URL как последний для сервера (можно использовать для перезапуска)
             await interaction.edit_original_response(content=f"🎶 Сейчас играет: **{title}**")
         else:
             await interaction.edit_original_response(content="❌ Не удалось воспроизвести.")
     except Exception as e:
         await interaction.edit_original_response(content=f"❌ Ошибка: {str(e)}")
 
-# /стоп
+# ----- КОМАНДА: /стоп -----
 @tree.command(name="стоп", description="Остановить воспроизведение")
 async def stop(interaction: discord.Interaction):
     player = get_player(interaction.guild.id)
@@ -226,6 +217,6 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ Сейчас ничего не играет.", ephemeral=True)
 
-# ===== ЗАПУСК =====
+# ----- ЗАПУСК -----
 if __name__ == "__main__":
     bot.run(TOKEN)
