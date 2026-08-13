@@ -7,11 +7,8 @@ import os
 import asyncio
 import yt_dlp
 
-# ===== ВСТАВЬТЕ СВОЙ ТОКЕН СЮДА =====
-TOKEN = 'ВАШ_ТОКЕН_СЮДА'
-# =====================================
+TOKEN = 'ВАШ_ТОКЕН_СЮДА'  # ЗАМЕНИТЕ
 
-# ===== НАСТРОЙКИ =====
 DATA_FILE = 'radio_urls.json'
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -33,15 +30,16 @@ YTDL_OPTIONS = {
     'source_address': '0.0.0.0',
 }
 
+# Создаём интенты, НЕ включая никакие привилегированные
 intents = discord.Intents.default()
-intents.message_content = True
+# intents.message_content = False  # даже не упоминаем
 intents.guilds = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
-# ----- Работа с файлом URL -----
+# ---------- Остальной код (без изменений) ----------
 def load_urls():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -54,7 +52,6 @@ def save_urls(urls):
 
 radio_urls = load_urls()
 
-# ----- Хранилище плееров -----
 class GuildPlayer:
     def __init__(self, guild_id):
         self.guild_id = guild_id
@@ -100,7 +97,6 @@ def get_player(guild_id):
         players[guild_id] = GuildPlayer(guild_id)
     return players[guild_id]
 
-# ----- СОБЫТИЯ -----
 @bot.event
 async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
@@ -110,7 +106,6 @@ async def on_ready():
     except Exception as e:
         print(f'❌ Ошибка синхронизации: {e}')
 
-# ----- КОМАНДА: /в_войс -----
 @tree.command(name="в_войс", description="Подключить бота к голосовому каналу")
 @app_commands.describe(канал="Выберите голосовой канал")
 async def join_voice(interaction: discord.Interaction, канал: discord.VoiceChannel = None):
@@ -141,7 +136,6 @@ async def join_voice(interaction: discord.Interaction, канал: discord.Voice
     else:
         await interaction.response.send_message(f"✅ Подключён к **{target.name}**. Используйте `/плей` или `/настройка_юрл`.")
 
-# ----- КОМАНДА: /из_войса -----
 @tree.command(name="из_войса", description="Отключить бота")
 async def leave_voice(interaction: discord.Interaction):
     voice = interaction.guild.voice_client
@@ -155,7 +149,6 @@ async def leave_voice(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ Бот не в канале.", ephemeral=True)
 
-# ----- КОМАНДА: /настройка_юрл -----
 @tree.command(name="настройка_юрл", description="Сохранить URL радиостанции для сервера")
 @app_commands.describe(url="Ссылка на аудиопоток (mp3, aac, etc.)")
 async def set_radio(interaction: discord.Interaction, url: str):
@@ -172,7 +165,6 @@ async def set_radio(interaction: discord.Interaction, url: str):
     else:
         await interaction.response.send_message("✅ URL сохранён. Подключите бота командой `/в_войс`.")
 
-# ----- КОМАНДА: /плей -----
 @tree.command(name="плей", description="Воспроизвести YouTube/Rutube (прямой эфир или видео)")
 @app_commands.describe(запрос="Ссылка или поисковый запрос")
 async def play(interaction: discord.Interaction, запрос: str):
@@ -207,7 +199,6 @@ async def play(interaction: discord.Interaction, запрос: str):
     except Exception as e:
         await interaction.edit_original_response(content=f"❌ Ошибка: {str(e)}")
 
-# ----- КОМАНДА: /стоп -----
 @tree.command(name="стоп", description="Остановить воспроизведение")
 async def stop(interaction: discord.Interaction):
     player = get_player(interaction.guild.id)
@@ -217,6 +208,5 @@ async def stop(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ Сейчас ничего не играет.", ephemeral=True)
 
-# ----- ЗАПУСК -----
 if __name__ == "__main__":
     bot.run(TOKEN)
